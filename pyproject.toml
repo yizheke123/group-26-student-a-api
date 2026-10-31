@@ -14,6 +14,8 @@ dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",
     "pydantic>=2.8,<3",
+    "xgboost==3.0.5",
+    "pandas==2.2.2"
     "requests>=2.32,<3"
 ]
 
