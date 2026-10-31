@@ -1,28 +1,41 @@
 """Student A: Zheke Yi (25655150), Group 26.
-POST /features provides Return20 using completed UTC daily candles.
+
+Provide Return20 and predict the Asset Performance Index
+seven calendar days ahead using the exported XGBoost model.
 """
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from statistics import mean, stdev
 from typing import Literal
-import math
 import logging
+import math
 
+import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
+from xgboost import XGBRegressor
 
-
-app = FastAPI(
-    title="Student A — Return20 API",
-    description="20-day return from public exchange daily data.",
-    version="1.0.0",
-)
 
 logger = logging.getLogger(__name__)
 
+ROOT = Path(__file__).resolve().parents[1]
+MODEL_PATH = ROOT / "models" / "api_xgboost.json"
+
 DAY_MS = 86_400_000
 
-# USD pairs are used when falling back to Bitfinex.
+FEATURE_NAMES = [
+    "Return20",
+    "TrendStrength",
+    "RelativeVolume",
+    "Volatility20",
+]
+
+# Your current notebook trained and evaluated BTCUSDT only.
+TRAINED_TOKENS = ["BTC"]
+
 BITFINEX_PAIRS = {
     "BTC": "tBTCUSD",
     "ETH": "tETHUSD",
@@ -35,6 +48,42 @@ BITFINEX_PAIRS = {
 }
 
 
+# --------------------------------------------------
+# Model loading
+# --------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.model = None
+    app.state.model_error = None
+
+    try:
+        model = XGBRegressor()
+        model.load_model(MODEL_PATH)
+
+        if model.get_booster().feature_names != FEATURE_NAMES:
+            raise ValueError("Model feature names do not match.")
+
+        app.state.model = model
+
+    except Exception:
+        logger.exception("Unable to load the XGBoost model.")
+        app.state.model_error = (
+            "Model unavailable. Check models/api_xgboost.json "
+            "and the deployment logs."
+        )
+
+    yield
+
+
+app = FastAPI(
+    title="Student A — Asset Performance API",
+    description="Return20 features and seven-day API predictions.",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+
 class FeatureRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -45,6 +94,10 @@ class FeatureRequest(BaseModel):
 
     forecast_horizon: Literal[7] = 7
 
+
+# --------------------------------------------------
+# Public exchange data
+# --------------------------------------------------
 
 def read_json(url, params):
     response = requests.get(
@@ -62,9 +115,15 @@ def read_json(url, params):
     return rows
 
 
-def validate_closes(rows, close_index, start_ms, today_ms):
-    """Require exactly 21 consecutive completed UTC daily closes."""
-    closes = {}
+def validate_candles(
+    rows,
+    close_index,
+    volume_index,
+    start_ms,
+    today_ms,
+):
+    """Require 21 consecutive completed UTC daily candles."""
+    candles = {}
 
     for row in rows:
         if not isinstance(row, list):
@@ -72,38 +131,44 @@ def validate_closes(rows, close_index, start_ms, today_ms):
 
         timestamp = int(row[0])
 
-        # Ignore candles outside the requested completed period.
         if not start_ms <= timestamp < today_ms:
             continue
 
         if timestamp % DAY_MS != 0:
             raise ValueError("Candle is not aligned to UTC midnight.")
 
-        if timestamp in closes:
+        if timestamp in candles:
             raise ValueError("Duplicate daily candle.")
 
         close = float(row[close_index])
+        volume = float(row[volume_index])
 
         if not math.isfinite(close) or close <= 0:
             raise ValueError("Invalid closing price.")
 
-        closes[timestamp] = close
+        if not math.isfinite(volume) or volume < 0:
+            raise ValueError("Invalid trading volume.")
+
+        candles[timestamp] = {
+            "close": close,
+            "volume": volume,
+        }
 
     expected = [
         start_ms + i * DAY_MS
         for i in range(21)
     ]
 
-    if sorted(closes) != expected:
+    if sorted(candles) != expected:
         raise ValueError(
             "Missing daily candles or yesterday's candle unavailable."
         )
 
-    return [closes[timestamp] for timestamp in expected]
+    return [candles[timestamp] for timestamp in expected]
 
 
-def load_closes(token, start_ms, today_ms):
-    """Try Binance, then Bitfinex; never mix providers in one window."""
+def load_candles(token, start_ms, today_ms):
+    """Use one provider for the entire daily window."""
     providers = []
 
     if token != "XMR":
@@ -124,6 +189,7 @@ def load_closes(token, start_ms, today_ms):
                     "limit": 30,
                 },
                 "close_index": 4,
+                "volume_index": 5,
             })
 
     pair = BITFINEX_PAIRS[token]
@@ -143,6 +209,7 @@ def load_closes(token, start_ms, today_ms):
             "limit": 30,
         },
         "close_index": 2,
+        "volume_index": 5,
     })
 
     for provider in providers:
@@ -152,9 +219,10 @@ def load_closes(token, start_ms, today_ms):
                 provider["params"],
             )
 
-            closes = validate_closes(
+            candles = validate_candles(
                 rows,
                 provider["close_index"],
+                provider["volume_index"],
                 start_ms,
                 today_ms,
             )
@@ -165,7 +233,7 @@ def load_closes(token, start_ms, today_ms):
                 "quote_currency": provider["quote_currency"],
             }
 
-            return closes, source
+            return candles, source
 
         except (
             requests.RequestException,
@@ -190,28 +258,7 @@ def load_closes(token, start_ms, today_ms):
     )
 
 
-@app.get("/")
-def root():
-    return {
-        "student": "Zheke Yi",
-        "student_id": "25655150",
-        "group": "26",
-        "service": "Return20 feature API",
-        "docs": "/docs",
-    }
-
-
-@app.get("/health")
-def health():
-    # Service availability only; exchanges are checked per request.
-    return {
-        "status": "ok",
-        "exchange_status": "checked when /features is called",
-    }
-
-
-@app.post("/features")
-def features(request: FeatureRequest):
+def market_window(token):
     today = datetime.now(timezone.utc).replace(
         hour=0,
         minute=0,
@@ -219,21 +266,126 @@ def features(request: FeatureRequest):
         microsecond=0,
     )
 
-    observation_date = today - timedelta(days=1)
+    observed = today - timedelta(days=1)
+    start = observed - timedelta(days=20)
 
-    # Yesterday plus the preceding 20 days = 21 daily closes.
-    start = observation_date - timedelta(days=20)
-
-    today_ms = int(today.timestamp() * 1000)
-    start_ms = int(start.timestamp() * 1000)
-
-    closes, source = load_closes(
-        request.token,
-        start_ms,
-        today_ms,
+    candles, source = load_candles(
+        token,
+        int(start.timestamp() * 1000),
+        int(today.timestamp() * 1000),
     )
 
-    return20 = closes[-1] / closes[0] - 1
+    return candles, source, observed
+
+
+def source_warnings(source):
+    if source["provider"] == "Bitfinex":
+        return [
+            "Uses Bitfinex USD candles. The model was trained "
+            "on Binance BTCUSDT; prices and volume may differ."
+        ]
+
+    return []
+
+
+# --------------------------------------------------
+# Feature calculations — match the notebook
+# --------------------------------------------------
+
+def calculate_model_features(candles):
+    closes = [row["close"] for row in candles]
+    volumes = [row["volume"] for row in candles]
+
+    sma20 = mean(closes[-20:])
+    average_volume20 = mean(volumes[-20:])
+
+    if average_volume20 <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="20-day average volume must be positive.",
+        )
+
+    daily_returns = [
+        closes[i] / closes[i - 1] - 1
+        for i in range(1, len(closes))
+    ]
+
+    values = {
+        "Return20": closes[-1] / closes[0] - 1,
+        "TrendStrength": closes[-1] / sma20 - 1,
+        "RelativeVolume": volumes[-1] / average_volume20,
+        "Volatility20": stdev(daily_returns),
+    }
+
+    if not all(math.isfinite(value) for value in values.values()):
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to calculate finite model features.",
+        )
+
+    return values
+
+
+def current_api(values):
+    rs = min(max((values["Return20"] + 0.20) / 0.40, 0), 1)
+    ts = min(max((values["TrendStrength"] + 0.10) / 0.20, 0), 1)
+    rv = min(values["RelativeVolume"], 2) / 2
+    ps = 1 - values["Volatility20"]
+
+    return 100 * (
+        0.40 * rs
+        + 0.30 * ts
+        + 0.20 * rv
+        + 0.10 * ps
+    )
+
+
+def require_model():
+    if app.state.model is None:
+        raise HTTPException(
+            status_code=503,
+            detail=app.state.model_error,
+        )
+
+    return app.state.model
+
+
+# --------------------------------------------------
+# Required endpoints
+# --------------------------------------------------
+
+@app.get("/")
+def root():
+    return {
+        "student": "Zheke Yi",
+        "student_id": "25655150",
+        "group": "26",
+        "service": "Asset Performance Analytics",
+        "target": "API_7d",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+def health():
+    loaded = app.state.model is not None
+
+    return {
+        "status": "ready" if loaded else "degraded",
+        "model_loaded": loaded,
+        "model_error": app.state.model_error,
+        "exchange_status": "checked per request",
+    }
+
+
+@app.post("/features")
+def features(request: FeatureRequest):
+    """Return20 remains available for all eight tokens."""
+    candles, source, observed = market_window(request.token)
+
+    return20 = (
+        candles[-1]["close"] / candles[0]["close"] - 1
+    )
 
     if not math.isfinite(return20):
         raise HTTPException(
@@ -241,25 +393,108 @@ def features(request: FeatureRequest):
             detail="Unable to calculate a finite Return20.",
         )
 
-    warnings = []
-
-    if source["provider"] == "Bitfinex":
-        warnings.append(
-            "Uses Bitfinex USD candles; values may differ "
-            "from Binance USDT candles."
-        )
-
     return {
         "token": request.token,
-        "date": observation_date.date().isoformat(),
-        "observation_date": observation_date.date().isoformat(),
+        "date": observed.date().isoformat(),
+        "observation_date": observed.date().isoformat(),
         "prediction_date": (
-            observation_date + timedelta(days=7)
+            observed + timedelta(days=7)
         ).date().isoformat(),
-        "forecast_horizon": request.forecast_horizon,
+        "forecast_horizon": 7,
         "features": {
             "Return20": return20,
         },
         "data_source": source,
-        "warnings": warnings,
+        "warnings": (
+            [
+                "Uses Bitfinex USD candles; values may differ "
+                "from Binance USDT candles."
+            ]
+            if source["provider"] == "Bitfinex"
+            else []
+        ),
+    }
+
+
+@app.post("/predict")
+def predict(request: FeatureRequest):
+    """Calculate the four features and run the exported model."""
+    model = require_model()
+
+    if request.token not in TRAINED_TOKENS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "The current model was trained on BTCUSDT only. "
+                "Prediction for this token is not supported yet."
+            ),
+        )
+
+    candles, source, observed = market_window(request.token)
+    values = calculate_model_features(candles)
+
+    inputs = pd.DataFrame(
+        [values],
+        columns=FEATURE_NAMES,
+    )
+
+    prediction = float(model.predict(inputs)[0])
+
+    if not math.isfinite(prediction):
+        raise HTTPException(
+            status_code=500,
+            detail="Model returned a non-finite prediction.",
+        )
+
+    return {
+        "token": request.token,
+        "target": "API_7d",
+        "prediction": prediction,
+        "current_api": current_api(values),
+        "unit": "API score points",
+        "date": observed.date().isoformat(),
+        "observation_date": observed.date().isoformat(),
+        "prediction_date": (
+            observed + timedelta(days=7)
+        ).date().isoformat(),
+        "forecast_horizon": 7,
+        "features_used": values,
+        "feature_sources": {
+            name: source["provider"]
+            for name in FEATURE_NAMES
+        },
+        "data_source": source,
+        "warnings": source_warnings(source),
+    }
+
+
+@app.get("/model-metadata")
+def model_metadata():
+    model = require_model()
+
+    return {
+        "model_type": "XGBRegressor",
+        "target": "API_7d",
+        "forecast_horizon_days": 7,
+        "trained_tokens": TRAINED_TOKENS,
+        "training_pair": "BTCUSDT",
+        "features": FEATURE_NAMES,
+        "feature_definitions": {
+            "Return20": "close[t] / close[t-20] - 1",
+            "TrendStrength": "close[t] / SMA20[t] - 1",
+            "RelativeVolume": "volume[t] / AverageVolume20[t]",
+            "Volatility20": (
+                "Sample standard deviation of 20 daily simple "
+                "returns; ddof=1; not annualised"
+            ),
+        },
+        "feature_importance": {
+            name: float(value)
+            for name, value in zip(
+                FEATURE_NAMES,
+                model.feature_importances_,
+            )
+        },
+        "importance_type": "gain",
+        "number_of_trees": model.get_booster().num_boosted_rounds(),
     }
