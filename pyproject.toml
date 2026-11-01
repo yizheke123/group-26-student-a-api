@@ -1,15 +1,17 @@
-[build-system]
+[[build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "group-26-student-a-api"
-version = "1.0.0"
-description = "Student A Return20 feature service for Group 26"
+version = "1.1.0"
+description = "Financial Intelligence API for 8 cryptocurrencies"
 requires-python = ">=3.12,<3.13"
+
 authors = [
     {name = "Zheke Yi"}
 ]
+
 dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",
@@ -18,6 +20,7 @@ dependencies = [
     "xgboost==3.0.5",
     "pandas==2.2.2",
     "scikit-learn==1.6.1",
+    "numpy>=1.26,<3",
 ]
 
 [tool.setuptools.packages.find]
