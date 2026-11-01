@@ -1,0 +1,19 @@
+{
+    "features": [
+        "Return20",
+        "TrendStrength",
+        "RelativeVolume",
+        "Volatility20"
+    ],
+    "target": "API_7d",
+    "models": {
+        "BTCUSDT": "BTCUSDT_api_xgboost.json",
+        "ETHUSDT": "ETHUSDT_api_xgboost.json",
+        "XRPUSDT": "XRPUSDT_api_xgboost.json",
+        "SOLUSDT": "SOLUSDT_api_xgboost.json",
+        "DOGEUSDT": "DOGEUSDT_api_xgboost.json",
+        "XMRUSDT": "XMRUSDT_api_xgboost.json",
+        "XLMUSDT": "XLMUSDT_api_xgboost.json",
+        "TRXUSDT": "TRXUSDT_api_xgboost.json"
+    }
+}
